@@ -2,6 +2,8 @@
 #include <fstream>
 #include <chrono>
 #include <random>
+#include <SDL2/SDL.h>
+#include <iostream>
 
 class Chip8
 {
@@ -26,7 +28,6 @@ public:
     std::uniform_int_distribution<uint8_t> randByte;
 
 private:
-
     // 1. The Typedef MUST be first, and spelled correctly!
     typedef void (Chip8::*Chip8Func)();
 
@@ -110,12 +111,75 @@ uint8_t fontSet[FONTSET_SIZE] =
 Chip8::Chip8()
     : randGen(std::chrono::system_clock::now().time_since_epoch().count())
 {
-
+    pc = START_ADDRESS;
+    // 1. Set up the random number generator
     randByte = std::uniform_int_distribution<uint8_t>(0, 255U);
+    // 2. Load fonts into memory
     for (unsigned int i = 0; i < FONTSET_SIZE; i++)
     {
         memory[FONTSET_START_ADDRESS + i] = fontSet[i];
     }
+    // 3. Set up function pointer table
+    // First, link the main table to the primary instructions and sub-menus
+
+    table[0x0] = &Chip8::Table0;
+    table[0x1] = &Chip8::OP_1nnn;
+    table[0x2] = &Chip8::OP_2nnn;
+    table[0x3] = &Chip8::OP_3xkk;
+    table[0x4] = &Chip8::OP_4xkk;
+    table[0x5] = &Chip8::OP_5xy0;
+    table[0x6] = &Chip8::OP_6xkk;
+    table[0x7] = &Chip8::OP_7xkk;
+    table[0x8] = &Chip8::Table8;
+    table[0x9] = &Chip8::OP_9xy0;
+    table[0xA] = &Chip8::OP_Annn;
+    table[0xB] = &Chip8::OP_Bnnn;
+    table[0xC] = &Chip8::OP_Cxkk;
+    table[0xD] = &Chip8::OP_Dxyn;
+    table[0xE] = &Chip8::TableE;
+    table[0xF] = &Chip8::TableF;
+
+    // 4. Fill the sub-tables with the NULL instruction for safety
+    for (size_t i = 0; i <= 0xE; i++)
+    {
+        table0[i] = &Chip8::OP_NULL;
+        table8[i] = &Chip8::OP_NULL;
+        tableE[i] = &Chip8::OP_NULL;
+    }
+
+    // 5. Link the specific instructions inside the sub-tables
+    table0[0x0] = &Chip8::OP_00E0;
+    table0[0xE] = &Chip8::OP_00EE;
+
+    table8[0x0] = &Chip8::OP_8xy0;
+    table8[0x1] = &Chip8::OP_8xy1;
+    table8[0x2] = &Chip8::OP_8xy2;
+    table8[0x3] = &Chip8::OP_8xy3;
+    table8[0x4] = &Chip8::OP_8xy4;
+    table8[0x5] = &Chip8::OP_8xy5;
+    table8[0x6] = &Chip8::OP_8xy6;
+    table8[0x7] = &Chip8::OP_8xy7;
+    table8[0xE] = &Chip8::OP_8xyE;
+
+    tableE[0x1] = &Chip8::OP_ExA1;
+    tableE[0xE] = &Chip8::OP_Ex9E;
+
+    // Fill the massive F table with NULL instructions first
+    for (size_t i = 0; i <= 0x65; i++)
+    {
+        tableF[i] = &Chip8::OP_NULL;
+    }
+
+    // Link the F instructions
+    tableF[0x07] = &Chip8::OP_Fx07;
+    tableF[0x0A] = &Chip8::OP_Fx0A;
+    tableF[0x15] = &Chip8::OP_Fx15;
+    tableF[0x18] = &Chip8::OP_Fx18;
+    tableF[0x1E] = &Chip8::OP_Fx1E;
+    tableF[0x29] = &Chip8::OP_Fx29;
+    tableF[0x33] = &Chip8::OP_Fx33;
+    tableF[0x55] = &Chip8::OP_Fx55;
+    tableF[0x65] = &Chip8::OP_Fx65;
 }
 
 void Chip8::loadROM(const char *filename)
@@ -142,6 +206,31 @@ void Chip8::loadROM(const char *filename)
         }
 
         delete[] buffer;
+    }
+}
+// ===== Chip8 Fetch, Decode, Execute cycle =====
+
+void Chip8::Cycle()
+{
+    // Fetch
+    opcode = (memory[pc] << 8u) | memory[pc + 1];
+
+    // Increment the PC before we execute anything
+    pc += 2;
+
+    // Decode and Execute
+    ((*this).*(table[(opcode & 0xF000u) >> 12u]))();
+
+    // Decrement the delay timer if it's been set
+    if (delayTimer > 0)
+    {
+        --delayTimer;
+    }
+
+    // Decrement the sound timer if it's been set
+    if (soundTimer > 0)
+    {
+        --soundTimer;
     }
 }
 
@@ -316,19 +405,11 @@ void Chip8::OP_8xy5()
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t Vy = (opcode & 0x00F0u) >> 4u;
 
-    // If Vx > Vy, then VF is set to 1,
-    // otherwise 0. Then Vy is subtracted from Vx, and the results stored in Vx.
+    // IMPORTANT: Calculate the flag BEFORE doing the subtraction
+    uint8_t flag = (registers[Vx] >= registers[Vy]) ? 1 : 0;
 
-    if (registers[Vx] > registers[Vy])
-    {
-        registers[0xF] = 1;
-    }
-    else
-    {
-        registers[0xF] = 0;
-    }
-
-    registers[Vx] -= registers[Vy];
+    registers[Vx] = registers[Vx] - registers[Vy];
+    registers[0xF] = flag;
 }
 
 // 16. Set Vx = Vx SHR 1. 8xy6 - SHR Vx
@@ -347,23 +428,17 @@ void Chip8::OP_8xy6()
 
 // 17. Set Vx = Vy - Vx, set VF = NOT borrow. 8xy7 - SUBN Vx, Vy
 
+// 8xy7: Subtract Vx from Vy
 void Chip8::OP_8xy7()
 {
     uint8_t Vx = (opcode & 0x0F00u) >> 8u;
     uint8_t Vy = (opcode & 0x00F0u) >> 4u;
 
-    // Set Vx = Vy - Vx, set VF = NOT borrow.
-
-    if (registers[Vy] > registers[Vx])
-    {
-        registers[0xF] = 1;
-    }
-    else
-    {
-        registers[0xF] = 0;
-    }
+    // IMPORTANT: Calculate the flag BEFORE doing the subtraction
+    uint8_t flag = (registers[Vy] >= registers[Vx]) ? 1 : 0;
 
     registers[Vx] = registers[Vy] - registers[Vx];
+    registers[0xF] = flag;
 }
 
 // 18. Set Vx = Vx SHL 1.8xyE - SHL Vx {, Vy}
@@ -435,21 +510,32 @@ void Chip8::OP_Dxyn()
     {
         uint8_t spriteByte = memory[index + row];
 
+        // 5. Loop over the 8 columns (every sprite in CHIP-8 is 8 pixels wide)
         for (unsigned int col = 0; col < 8; ++col)
         {
+            // Isolate the current pixel in the sprite (1 = on, 0 = off)
             uint8_t spritePixel = spriteByte & (0x80u >> col);
-            uint32_t *screenPixel = &video[(yPos + row) * VIDEO_WIDTH + (xPos + col)];
 
-            if (spritePixel)
+            // Calculate where this pixel belongs on the screen array
+            // If it goes off the edge of the screen, we stop drawing it
+            if ((xPos + col) < VIDEO_WIDTH && (yPos + row) < VIDEO_HEIGHT)
             {
-                // Screen pixel also on - collision
-                if (*screenPixel == 0xFFFFFFFF)
-                {
-                    registers[0xF] = 1;
-                }
+                uint32_t *screenPixel = &video[(yPos + row) * VIDEO_WIDTH + (xPos + col)];
 
-                // Effectively XOR with the sprite pixel
-                *screenPixel ^= 0xFFFFFFFF;
+                // If the sprite pixel we are trying to draw is ON
+                if (spritePixel)
+                {
+                    // If the screen pixel is ALSO ON, it means we are erasing it!
+                    // This is a collision! Set the VF register to 1.
+                    if (*screenPixel == 0xFFFFFFFF)
+                    {
+                        registers[0xF] = 1;
+                    }
+
+                    // XOR the pixel!
+                    // (0xFFFFFFFF is the hex value for a solid white RGBA pixel)
+                    *screenPixel ^= 0xFFFFFFFF;
+                }
             }
         }
     }
@@ -635,6 +721,7 @@ void Chip8::OP_Fx55()
     {
         memory[index + i] = registers[i];
     }
+    index += Vx + 1;
 }
 
 // 34. Read registers V0 through Vx from memory starting at location I. Fx65 - LD Vx, [I]
@@ -647,4 +734,341 @@ void Chip8::OP_Fx65()
     {
         registers[i] = memory[index + i];
     }
+    index += Vx + 1;
+}
+
+void Chip8::Table0()
+{
+    ((*this).*(table0[opcode & 0x000Fu]))();
+}
+
+void Chip8::Table8()
+{
+    ((*this).*(table8[opcode & 0x000Fu]))();
+}
+
+void Chip8::TableE()
+{
+    ((*this).*(tableE[opcode & 0x000Fu]))();
+}
+
+void Chip8::TableF()
+{
+    ((*this).*(tableF[opcode & 0x00FFu]))();
+}
+
+void Chip8::OP_NULL()
+{
+}
+
+class Platform
+{
+public:
+    Platform(char const *title, int windowWidth, int windowHeight, int textureWidth, int textureHeight)
+    {
+        SDL_Init(SDL_INIT_VIDEO);
+
+        window = SDL_CreateWindow(title, 0, 0, windowWidth, windowHeight, SDL_WINDOW_SHOWN);
+
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+
+        texture = SDL_CreateTexture(
+            renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STREAMING, textureWidth, textureHeight);
+    }
+
+    ~Platform()
+    {
+        SDL_DestroyTexture(texture);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+    }
+
+    void Update(void const *buffer, int pitch)
+    {
+        SDL_UpdateTexture(texture, nullptr, buffer, pitch);
+        SDL_RenderClear(renderer);
+        SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+        SDL_RenderPresent(renderer);
+    }
+
+    bool ProcessInput(uint8_t *keys)
+    {
+        bool quit = false;
+
+        SDL_Event event;
+
+        while (SDL_PollEvent(&event))
+        {
+            switch (event.type)
+            {
+            case SDL_QUIT:
+            {
+                quit = true;
+            }
+            break;
+
+            case SDL_KEYDOWN:
+            {
+                switch (event.key.keysym.sym)
+                {
+                case SDLK_ESCAPE:
+                {
+                    quit = true;
+                }
+                break;
+
+                case SDLK_x:
+                {
+                    keys[0] = 1;
+                }
+                break;
+
+                case SDLK_1:
+                {
+                    keys[1] = 1;
+                }
+                break;
+
+                case SDLK_2:
+                {
+                    keys[2] = 1;
+                }
+                break;
+
+                case SDLK_3:
+                {
+                    keys[3] = 1;
+                }
+                break;
+
+                case SDLK_q:
+                {
+                    keys[4] = 1;
+                }
+                break;
+
+                case SDLK_w:
+                {
+                    keys[5] = 1;
+                }
+                break;
+
+                case SDLK_e:
+                {
+                    keys[6] = 1;
+                }
+                break;
+
+                case SDLK_a:
+                {
+                    keys[7] = 1;
+                }
+                break;
+
+                case SDLK_s:
+                {
+                    keys[8] = 1;
+                }
+                break;
+
+                case SDLK_d:
+                {
+                    keys[9] = 1;
+                }
+                break;
+
+                case SDLK_z:
+                {
+                    keys[0xA] = 1;
+                }
+                break;
+
+                case SDLK_c:
+                {
+                    keys[0xB] = 1;
+                }
+                break;
+
+                case SDLK_4:
+                {
+                    keys[0xC] = 1;
+                }
+                break;
+
+                case SDLK_r:
+                {
+                    keys[0xD] = 1;
+                }
+                break;
+
+                case SDLK_f:
+                {
+                    keys[0xE] = 1;
+                }
+                break;
+
+                case SDLK_v:
+                {
+                    keys[0xF] = 1;
+                }
+                break;
+                }
+            }
+            break;
+
+            case SDL_KEYUP:
+            {
+                switch (event.key.keysym.sym)
+                {
+                case SDLK_x:
+                {
+                    keys[0] = 0;
+                }
+                break;
+
+                case SDLK_1:
+                {
+                    keys[1] = 0;
+                }
+                break;
+
+                case SDLK_2:
+                {
+                    keys[2] = 0;
+                }
+                break;
+
+                case SDLK_3:
+                {
+                    keys[3] = 0;
+                }
+                break;
+
+                case SDLK_q:
+                {
+                    keys[4] = 0;
+                }
+                break;
+
+                case SDLK_w:
+                {
+                    keys[5] = 0;
+                }
+                break;
+
+                case SDLK_e:
+                {
+                    keys[6] = 0;
+                }
+                break;
+
+                case SDLK_a:
+                {
+                    keys[7] = 0;
+                }
+                break;
+
+                case SDLK_s:
+                {
+                    keys[8] = 0;
+                }
+                break;
+
+                case SDLK_d:
+                {
+                    keys[9] = 0;
+                }
+                break;
+
+                case SDLK_z:
+                {
+                    keys[0xA] = 0;
+                }
+                break;
+
+                case SDLK_c:
+                {
+                    keys[0xB] = 0;
+                }
+                break;
+
+                case SDLK_4:
+                {
+                    keys[0xC] = 0;
+                }
+                break;
+
+                case SDLK_r:
+                {
+                    keys[0xD] = 0;
+                }
+                break;
+
+                case SDLK_f:
+                {
+                    keys[0xE] = 0;
+                }
+                break;
+
+                case SDLK_v:
+                {
+                    keys[0xF] = 0;
+                }
+                break;
+                }
+            }
+            break;
+            }
+        }
+
+        return quit;
+    }
+
+private:
+    SDL_Window *window{};
+    SDL_Renderer *renderer{};
+    SDL_Texture *texture{};
+};
+
+int main(int argc, char *argv[])
+{
+    if (argc != 4)
+    {
+        std::cerr << "Usage: " << argv[0] << " <Scale> <Delay> <ROM>\n";
+        std::exit(EXIT_FAILURE);
+    }
+
+    int videoScale = std::stoi(argv[1]);
+    int cycleDelay = std::stoi(argv[2]);
+    char const *romFilename = argv[3];
+
+    Platform platform("CHIP-8 Emulator", VIDEO_WIDTH * videoScale, VIDEO_HEIGHT * videoScale, VIDEO_WIDTH, VIDEO_HEIGHT);
+
+    Chip8 chip8;
+    chip8.loadROM(romFilename);
+
+    int videoPitch = sizeof(chip8.video[0]) * VIDEO_WIDTH;
+
+    auto lastCycleTime = std::chrono::high_resolution_clock::now();
+    bool quit = false;
+
+    while (!quit)
+    {
+        quit = platform.ProcessInput(chip8.keypad);
+
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float dt = std::chrono::duration<float, std::chrono::milliseconds::period>(currentTime - lastCycleTime).count();
+
+        if (dt > cycleDelay)
+        {
+            lastCycleTime = currentTime;
+
+            chip8.Cycle();
+
+            platform.Update(chip8.video, videoPitch);
+        }
+    }
+
+    return 0;
 }
